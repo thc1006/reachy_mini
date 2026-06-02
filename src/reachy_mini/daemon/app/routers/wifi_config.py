@@ -1,6 +1,7 @@
 """WiFi Configuration Routers."""
 
 import logging
+import time
 from enum import Enum
 from threading import Lock, Thread
 
@@ -124,7 +125,7 @@ def connect_to_wifi_network(
                 setup_wifi_connection(name=ssid, ssid=ssid, password=password)
             except Exception as e:
                 error = e
-                logger.error(f"Failed to connect to WiFi network '{ssid}': {e}")
+                logger.exception(f"Failed to connect to WiFi network '{ssid}'")
                 logger.info("Reverting to hotspot...")
                 remove_connection(name=ssid)
                 setup_wifi_connection(
@@ -247,6 +248,48 @@ def check_if_connection_active(name: str) -> bool:
     return any(c.name == name and c.device != "--" for c in get_wifi_connections())
 
 
+# A user-triggered connect arrives while the robot is serving its own
+# AP/hotspot, so NetworkManager's scan cache is stale or empty for nearby APs.
+# nmcli's wifi_connect needs the target SSID in the current scan list; without
+# a fresh rescan it intermittently fails with "No network with SSID found" and
+# we fall back to hotspot. Rescan-then-retry mirrors ensure_wifi_on_startup(),
+# which is reliable for exactly this reason.
+WIFI_CONNECT_MAX_RETRIES = 3
+WIFI_CONNECT_RETRY_DELAY = 3  # seconds between attempts
+WIFI_CONNECT_SCAN_SETTLE = 2  # seconds to let the rescan populate before connecting
+
+
+def _connect_station_with_rescan(ssid: str, password: str) -> None:
+    """Join an AP as a station, rescanning before each attempt.
+
+    See the WIFI_CONNECT_* constants above for why the rescan + retry is needed.
+    Raises the last nmcli error if every attempt fails so the caller can fall
+    back to hotspot.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, WIFI_CONNECT_MAX_RETRIES + 1):
+        try:
+            # Refresh the scan list after AP mode; best-effort (a rescan can
+            # fail if one is already in flight, which is harmless here).
+            try:
+                nmcli.device.wifi_rescan()
+                time.sleep(WIFI_CONNECT_SCAN_SETTLE)
+            except Exception as e:
+                logger.debug(f"wifi_rescan before connect failed (continuing): {e}")
+            nmcli.device.wifi_connect(ssid=ssid, password=password)
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"wifi_connect attempt {attempt}/{WIFI_CONNECT_MAX_RETRIES} "
+                f"for '{ssid}' failed: {e}"
+            )
+            if attempt < WIFI_CONNECT_MAX_RETRIES:
+                time.sleep(WIFI_CONNECT_RETRY_DELAY)
+    assert last_err is not None  # loop body ran at least once
+    raise last_err
+
+
 def setup_wifi_connection(
     name: str, ssid: str, password: str, is_hotspot: bool = False
 ) -> None:
@@ -258,7 +301,7 @@ def setup_wifi_connection(
         if is_hotspot:
             nmcli.device.wifi_hotspot(ssid=ssid, password=password)
         else:
-            nmcli.device.wifi_connect(ssid=ssid, password=password)
+            _connect_station_with_rescan(ssid=ssid, password=password)
         return
 
     logger.info("WiFi configuration already exists.")
@@ -289,8 +332,6 @@ def ensure_wifi_on_startup() -> None:
     On final failure the daemon keeps running so the robot stays
     reachable via Bluetooth for recovery.
     """
-    import time
-
     for attempt in range(1, WIFI_INIT_MAX_RETRIES + 1):
         try:
             # Make sure wlan0 is up and running
